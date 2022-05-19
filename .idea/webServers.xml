@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="2cfdc4ea-e223-48d6-9f01-620455302b4f" name="80GA100">
+        <fileTransfer rootFolder="/data/webw5/zengjielin" accessType="SFTP" host="172.18.11.1" port="3252" sshConfigId="854f7dff-b9a0-495e-b83e-62793230f2b9" sshConfig="webw5@172.18.11.1:3252 password">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" keepAliveTimeout="0" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>
