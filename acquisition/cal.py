@@ -8,9 +8,11 @@ import torch
 import torch.nn.functional as F
 from sklearn.neighbors import KNeighborsClassifier
 from sklearn.neighbors.dist_metrics import DistanceMetric
+from sklearn.cluster import KMeans
 from torch import nn
 from torch.nn.functional import normalize
 from tqdm import tqdm
+import random
 
 # import faiss
 
@@ -471,3 +473,184 @@ def contrastive_acquisition(args, annotations_per_iteration, X_original, y_origi
             stats['distances'] = [float(x) for x in distances.mean(axis=1)]
 
     return sampled_ind, stats
+
+
+def mix_acquisition(args, annotations_per_iteration, X_original, y_original,
+                            labeled_inds, candidate_inds, discarded_inds, original_inds,
+                            tokenizer,
+                            train_results,
+                            results_dpool, logits_dpool, bert_representations=None,
+                            train_dataset=None,
+                            model=None,
+                            tfidf_dtrain_reprs=None, tfidf_dpool_reprs=None):
+
+    if train_dataset is None:
+        train_dataset = get_glue_tensor_dataset(labeled_inds, args, args.task_name, tokenizer, train=True)
+    _train_results, train_logits = my_evaluate(train_dataset, args, model, prefix="",
+                                               al_test=False, mc_samples=None,
+                                               return_mean_embs=args.mean_embs,
+                                               return_mean_output=args.mean_out,
+                                               return_cls=args.cls
+                                               )
+    if args.bert_rep and bert_representations is not None:
+        # Use representations of pretrained model
+        dtrain_reprs = bert_representations[labeled_inds]
+        dpool_reprs = bert_representations[candidate_inds]
+    elif tfidf_dtrain_reprs is not None:
+        # Use tfidf representations
+        dtrain_reprs = tfidf_dtrain_reprs
+        dpool_reprs = tfidf_dpool_reprs
+    else:
+        # Use representations of current fine-tuned model *CAL*
+        if args.mean_embs and args.cls:
+            dtrain_reprs = torch.cat((_train_results['bert_mean_inputs'], _train_results['bert_cls']), dim=1)
+            dpool_reprs = torch.cat((results_dpool['bert_mean_inputs'], results_dpool['bert_cls']), dim=1)
+        elif args.mean_embs:
+            embs = 'bert_mean_inputs'
+            dtrain_reprs = _train_results[embs]
+            dpool_reprs = results_dpool[embs]
+        elif args.mean_out:
+            embs = 'bert_mean_output'
+            dtrain_reprs = _train_results[embs]
+            dpool_reprs = results_dpool[embs]
+        elif args.cls:
+            embs = 'bert_cls'
+            dtrain_reprs = _train_results[embs]
+            dpool_reprs = results_dpool[embs]
+        else:
+            NotImplementedError
+
+    if tfidf_dtrain_reprs is None:
+        train_bert_emb = normalize(dtrain_reprs).detach().cpu()
+        dpool_bert_emb = normalize(dpool_reprs).detach().cpu()
+    else:
+        train_bert_emb = dtrain_reprs
+        dpool_bert_emb = dpool_reprs
+
+    distances = None
+
+    num_adv = None
+
+    # criterion = nn.KLDivLoss(reduction='none') if not args.ce else nn.BCEWithLogitsLoss()
+    criterion = nn.KLDivLoss(reduction='none') if not args.ce else nn.CrossEntropyLoss()
+    dist = DistanceMetric.get_metric('euclidean')
+
+    kl_scores = []
+    num_adv = 0
+    distances = []
+    query_candicate = []
+    anchors = []
+
+    # calculate the center of each class in label pool
+    X = train_bert_emb
+    y = np.array(y_original)[labeled_inds]
+    for i in range(args.num_classes):
+        emb = X[y == i]
+        if emb.size(0) == 0:
+            emb = X
+        anchors.append(emb.mean(dim=0))
+
+    # calculate the parameter alpha
+    alpha = 0.5
+
+    model.eval()
+    for unlab_i, candidate in enumerate(
+            tqdm(zip(dpool_bert_emb, logits_dpool), desc="Finding neighbours for every unlabeled data point")):
+        # find indices of closesest "neighbours" in train set
+        unlab_representation, unlab_logit = candidate
+
+        for i in range(args.num_classes):
+            emb_mix = (1 - alpha) * unlab_representation + alpha * anchors[i]
+            logits_mix = model.classifier(emb_mix.unsqueeze(0))
+            if unlab_logit.argmax(dim=0) != logits_mix[0].argmax(dim=0):
+                query_candicate.append(unlab_i)
+                break
+
+    candidate_emb = dpool_bert_emb[query_condicate].view(len(query_condicate), -1)
+    candidate_emb = candidate_emb.numpy()
+    n = min(annotations_per_iteration, len(query_candicate))
+    cluster_learner = KMeans(n_cluesters=n)
+    cluster_learner.fit(candidate_emb)
+
+    cluster_idxs = cluster_learner.predict(candidate_emb)
+    centers = cluster_learner.cluster_centers_[cluster_idxs]
+    dis = (candidate_emb - centers) ** 2
+    dis = dis.sum(axis=1)
+    selected_candidate_inds = np.array(
+        np.arange(candidate_emb.shape[0])[cluster_idxs == i][dis[cluster_idxs == i].argmin()] for i in range(n)
+        if (cluster_idxs == i).sum() > 0)
+
+    selected_inds = list(np.array(query_candicate)[selected_candidate_inds])
+    if len(selected_inds) < annotations_per_iteration:
+        remain = annotations_per_iteration - len(selected_inds)
+        remain_inds = random.sample([i for i in range(candidate_inds) if i not in selected_inds], remain)
+        selected_inds = selected_inds + remain_inds
+
+    # map from dpool inds to original inds
+    sampled_ind = list(np.array(candidate_inds)[selected_inds])  # in terms of original inds
+
+    if num_adv is not None:
+        num_adv_per = round(num_adv / len(candidate_inds), 2)
+
+    y_lab = np.asarray(y_original, dtype='object')[labeled_inds]
+    X_unlab = np.asarray(X_original, dtype='object')[candidate_inds]
+    y_unlab = np.asarray(y_original, dtype='object')[candidate_inds]
+
+    labels_list_previous = list(y_lab)
+    c = collections.Counter(labels_list_previous)
+    stats_list_previous = [(i, c[i] / len(labels_list_previous) * 100.0) for i in c]
+
+    new_samples = np.asarray(X_original, dtype='object')[sampled_ind]
+    new_labels = np.asarray(y_original, dtype='object')[sampled_ind]
+
+    # Mean and std of length of selected sequences
+    if args.task_name in ['sst-2', 'ag_news', 'dbpedia', 'trec-6', 'imdb', 'pubmed', 'sentiment']: # single sequence
+        l = [len(x.split()) for x in new_samples]
+    elif args.dataset_name in ['mrpc', 'mnli', 'qnli', 'cola', 'rte', 'qqp', 'nli']:
+        l = [len(sentence[0].split()) + len(sentence[1].split()) for sentence in new_samples]  # pairs of sequences
+    assert type(l) is list, "type l: {}, l: {}".format(type(l), l)
+    length_mean = np.mean(l)
+    length_std = np.std(l)
+    length_min = np.min(l)
+    length_max = np.max(l)
+
+    # Percentages of each class
+    labels_list_selected = list(np.array(y_original)[sampled_ind])
+    c = collections.Counter(labels_list_selected)
+    stats_list = [(i, c[i] / len(labels_list_selected) * 100.0) for i in c]
+
+    labels_list_after = list(new_labels) + list(y_lab)
+    c = collections.Counter(labels_list_after)
+    stats_list_all = [(i, c[i] / len(labels_list_after) * 100.0) for i in c]
+
+    assert len(set(sampled_ind)) == len(sampled_ind)
+    assert bool(not set(sampled_ind) & set(labeled_inds))
+    assert len(new_samples) == annotations_per_iteration, 'len(new_samples)={}, annotatations_per_it={}'.format(
+        len(new_samples),
+        annotations_per_iteration)
+    assert len(labeled_inds) + len(candidate_inds) + len(discarded_inds) == len(original_inds), "labeled {}, " \
+                                                                                                "candidate {}, " \
+                                                                                                "disgarded {}, " \
+                                                                                                "original {}".format(
+        len(labeled_inds),
+        len(candidate_inds),
+        len(discarded_inds),
+        len(original_inds))
+
+    stats = {'length': {'mean': float(length_mean),
+                        'std': float(length_std),
+                        'min': float(length_min),
+                        'max': float(length_max)},
+             'class_selected_samples': stats_list,
+             'class_samples_after': stats_list_all,
+             'class_samples_before': stats_list_previous,
+             }
+    if distances is not None:
+        if type(distances) is list:
+            stats['distances'] = distances
+        else:
+            stats['distances'] = [float(x) for x in distances.mean(axis=1)]
+
+    return sampled_ind, stats
+
+

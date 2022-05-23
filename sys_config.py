@@ -25,6 +25,6 @@ CACHE_DIR = os.path.join(BASE_DIR, 'cache')
 
 ANALYSIS_DIR = os.path.join(BASE_DIR, 'analysis')
 
-acquisition_functions = ["random", "bald", "batch_bald", "entropy", "least_conf", "FTbertKM", "badge", "cal"]
+acquisition_functions = ["random", "bald", "batch_bald", "entropy", "least_conf", "FTbertKM", "badge", "cal", "mix"]
 
 

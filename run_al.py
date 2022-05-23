@@ -16,7 +16,7 @@ from transformers import set_seed, AutoTokenizer, AutoConfig, AutoModelForSequen
 sys.path.append("../../")
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
-from acquisition.cal import contrastive_acquisition
+from acquisition.cal import contrastive_acquisition, mix_acquisition
 from acquisition.uncertainty import select_alps, calculate_uncertainty
 from utilities.data_loader import get_glue_dataset, get_glue_tensor_dataset
 from utilities.preprocessors import output_modes
@@ -450,6 +450,28 @@ def al_loop(args):
                                                          bert_representations=bert_representations,
                                                          tfidf_dtrain_reprs=tfidf_dtrain_reprs,
                                                          tfidf_dpool_reprs=tfidf_dpool_reprs)
+        elif args.acquisition in ["mix"]:
+            if args.tfidf:
+                tfidf_dtrain_reprs = torch.tensor(list(np.array(tfidf_representations)[X_train_current_inds]))
+                tfidf_dpool_reprs = torch.tensor(list(np.array(tfidf_representations)[X_train_remaining_inds]))
+            else:
+                tfidf_dtrain_reprs = None
+                tfidf_dpool_reprs = None
+            sampled_ind, stats = mix_acquisition(args=args,
+                                                 annotations_per_iteration=annotations_per_iteration,
+                                                 X_original=X_train_original,
+                                                 y_original=y_train_original,
+                                                 labeled_inds=X_train_current_inds,
+                                                 candidate_inds=X_train_remaining_inds,
+                                                 discarded_inds=X_discarded_inds,
+                                                 original_inds=X_train_original_inds,
+                                                 tokenizer=tokenizer,
+                                                 train_results=train_results,
+                                                 results_dpool=results_dpool,
+                                                 logits_dpool=logits_dpool,
+                                                 bert_representations=bert_representations,
+                                                 tfidf_dtrain_reprs=tfidf_dtrain_reprs,
+                                                 tfidf_dpool_reprs=tfidf_dpool_reprs)
         else:
             sampled_ind, stats = calculate_uncertainty(args=args,
                                                        method=args.acquisition,
@@ -490,14 +512,14 @@ def al_loop(args):
         # X_train_current_inds and X_train_remaining_inds are lists of indices of the original dataset
         # sampled_inds is a list of indices OF THE X_train_remaining_inds(!!!!) LIST THAT SHOULD BE REMOVED
         # INCEPTION %&#!@***CAUTION***%&#!@
-        if args.acquisition in ['alps', 'badge', 'adv', 'FTbertKM', 'adv_train',"cal", "contrastive"]:
+        if args.acquisition in ['alps', 'badge', 'adv', 'FTbertKM', 'adv_train',"cal", "contrastive", "mix"]:
             X_train_current_inds += list(sampled_ind)
         else:
             X_train_current_inds += list(np.array(X_train_remaining_inds)[sampled_ind])
 
         assert len(ids_per_it[str(0)]) == args.init_train_data
 
-        if args.acquisition in ['alps', 'badge', 'adv', 'FTbertKM', 'adv_train',"cal", "contrastive"]:
+        if args.acquisition in ['alps', 'badge', 'adv', 'FTbertKM', 'adv_train',"cal", "contrastive", "mix"]:
             selected_dataset_ids = sampled_ind
             selected_dataset_ids = list(map(int, selected_dataset_ids))  # for json
             assert len(ids_per_it[str(0)]) == args.init_train_data
@@ -511,7 +533,7 @@ def al_loop(args):
         assert len(ids_per_it[str(0)]) == args.init_train_data
         assert len(ids_per_it[str(current_iteration)]) == annotations_per_iteration
 
-        if args.acquisition in ['alps', 'badge', 'adv', 'FTbertKM', 'adv_train',"cal", "contrastive"]:
+        if args.acquisition in ['alps', 'badge', 'adv', 'FTbertKM', 'adv_train',"cal", "contrastive", "mix"]:
             X_train_remaining_inds = [x for x in X_train_original_inds if x not in X_train_current_inds
                                       and x not in X_discarded_inds]
         else:
@@ -719,6 +741,20 @@ if __name__ == '__main__':
     parser.add_argument("-server", "--server", required=False, default='ford',
                         help="server on which this experiment runs")
     # parser.add_argument("--debug", required=False, default=False, help="debug mode")
+
+    # AlphaMix hyper-parameters
+    parser.add_argument('--alpha_cap', type=float, default=0.03125)
+    parser.add_argument('--alpha_opt', action="store_const", default=False, const=True)
+    parser.add_argument('--alpha_closed_form_approx', action="store_const", default=False, const=True)
+
+    # Gradient descent Alpha optimisation
+    parser.add_argument('--alpha_learning_rate', type=float, default=0.1,
+                        help='The learning rate of finding the optimised alpha')
+    parser.add_argument('--alpha_clf_coef', type=float, default=1.0)
+    parser.add_argument('--alpha_l2_coef', type=float, default=0.01)
+    parser.add_argument('--alpha_learning_iters', type=int, default=5,
+                        help='The number of iterations for learning alpha')
+    parser.add_argument('--alpha_learn_batch_size', type=int, default=1000000)
 
     args = parser.parse_args()
 
