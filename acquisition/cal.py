@@ -484,6 +484,9 @@ def mix_acquisition(args, annotations_per_iteration, X_original, y_original,
                             model=None,
                             tfidf_dtrain_reprs=None, tfidf_dpool_reprs=None):
 
+    processor = processors[args.task_name]()
+    if model is None and train_results is not None:
+        model = train_results['model']
     if train_dataset is None:
         train_dataset = get_glue_tensor_dataset(labeled_inds, args, args.task_name, tokenizer, train=True)
     _train_results, train_logits = my_evaluate(train_dataset, args, model, prefix="",
@@ -531,17 +534,13 @@ def mix_acquisition(args, annotations_per_iteration, X_original, y_original,
 
     num_adv = None
 
-    # criterion = nn.KLDivLoss(reduction='none') if not args.ce else nn.BCEWithLogitsLoss()
-    criterion = nn.KLDivLoss(reduction='none') if not args.ce else nn.CrossEntropyLoss()
-    dist = DistanceMetric.get_metric('euclidean')
-
-    kl_scores = []
     num_adv = 0
     distances = []
-    query_candicate = []
+    query_candidates = []
     anchors = []
 
     # calculate the center of each class in label pool
+    print("Starting calculate the center")
     X = train_bert_emb
     y = np.array(y_original)[labeled_inds]
     for i in range(args.num_classes):
@@ -555,21 +554,26 @@ def mix_acquisition(args, annotations_per_iteration, X_original, y_original,
 
     model.eval()
     for unlab_i, candidate in enumerate(
-            tqdm(zip(dpool_bert_emb, logits_dpool), desc="Finding neighbours for every unlabeled data point")):
+            tqdm(zip(dpool_bert_emb, logits_dpool), desc="Finding candidates")):
         # find indices of closesest "neighbours" in train set
         unlab_representation, unlab_logit = candidate
 
         for i in range(args.num_classes):
             emb_mix = (1 - alpha) * unlab_representation + alpha * anchors[i]
-            logits_mix = model.classifier(emb_mix.unsqueeze(0))
+            emb_mix = emb_mix.unsqueeze(0)
+            emb_mix = emb_mix.to(args.device)
+            logits_mix = model.classifier(emb_mix)
+            logits_mix = logits_mix.detach().cpu()
             if unlab_logit.argmax(dim=0) != logits_mix[0].argmax(dim=0):
-                query_candicate.append(unlab_i)
+                query_candidates.append(unlab_i)
                 break
 
-    candidate_emb = dpool_bert_emb[query_condicate].view(len(query_condicate), -1)
+    print("Get the candidate, candidate size is {}".format(len(query_candidates)))
+    candidate_emb = dpool_bert_emb[query_candidates].view(len(query_candidates), -1)
     candidate_emb = candidate_emb.numpy()
-    n = min(annotations_per_iteration, len(query_candicate))
-    cluster_learner = KMeans(n_cluesters=n)
+    n = min(annotations_per_iteration, len(query_candidates))
+    print("Starting cluster")
+    cluster_learner = KMeans(n_clusters=n)
     cluster_learner.fit(candidate_emb)
 
     cluster_idxs = cluster_learner.predict(candidate_emb)
@@ -577,13 +581,14 @@ def mix_acquisition(args, annotations_per_iteration, X_original, y_original,
     dis = (candidate_emb - centers) ** 2
     dis = dis.sum(axis=1)
     selected_candidate_inds = np.array(
-        np.arange(candidate_emb.shape[0])[cluster_idxs == i][dis[cluster_idxs == i].argmin()] for i in range(n)
-        if (cluster_idxs == i).sum() > 0)
+        [np.arange(candidate_emb.shape[0])[cluster_idxs == i][dis[cluster_idxs == i].argmin()] for i in range(n)
+        if (cluster_idxs == i).sum() > 0])
+    print("Clustering over")
 
-    selected_inds = list(np.array(query_candicate)[selected_candidate_inds])
+    selected_inds = list(np.array(query_candidates)[selected_candidate_inds])
     if len(selected_inds) < annotations_per_iteration:
         remain = annotations_per_iteration - len(selected_inds)
-        remain_inds = random.sample([i for i in range(candidate_inds) if i not in selected_inds], remain)
+        remain_inds = random.sample([i for i in range(len(candidate_inds)) if i not in selected_inds], remain)
         selected_inds = selected_inds + remain_inds
 
     # map from dpool inds to original inds
