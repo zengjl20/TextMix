@@ -11,8 +11,10 @@ from sklearn.neighbors.dist_metrics import DistanceMetric
 from sklearn.cluster import KMeans
 from torch import nn
 from torch.nn.functional import normalize
+from torch.autograd import Variable
 from tqdm import tqdm
 import random
+import math
 
 # import faiss
 
@@ -538,10 +540,12 @@ def mix_acquisition(args, annotations_per_iteration, X_original, y_original,
     distances = []
     query_candidates = []
     anchors = []
+    ulb_embedding = dpool_bert_emb
+    lb_embedding = train_bert_emb
 
     # calculate the center of each class in label pool
     print("Starting calculate the center")
-    X = train_bert_emb
+    X = lb_embedding
     y = np.array(y_original)[labeled_inds]
     for i in range(args.num_classes):
         emb = X[y == i]
@@ -549,16 +553,70 @@ def mix_acquisition(args, annotations_per_iteration, X_original, y_original,
             emb = X
         anchors.append(emb.mean(dim=0))
 
-    # calculate the parameter alpha
-    alpha = 0.5
+    probs_sorted, probs_sorted_idxs = logits_dpool.sort(descending=True)
+    pred_1 = probs_sorted_idxs[:, 0]
 
     model.eval()
+    if args.alpha_closed_form_approx:
+        var_emb = Variable(ulb_embedding, requires_grad=True).to(args.device)
+        logits_ = model.classifier(var_emb)
+        loss = F.cross_entropy(logits_, pred_1.to(args.device))
+        grads = torch.autograd.grad(loss, var_emb)[0].data.cpu()
+        del loss, var_emb, logits_
+    else:
+        grads = None
+
+    unlabeled_size = dpool_bert_emb.size(0)
+    embedding_size = dpool_bert_emb.size(1)
+
+    min_alphas = torch.ones((unlabeled_size, embedding_size), dtype=torch.float)
+    candidates = torch.zeros(unlabeled_size, dtype=torch.bool)
+
+    alpha_cap = 0.
+    while alpha_cap < 1.0:
+        alpha_cap += args.alpha_cap
+
+        pred_change, tmp_min_alphas = \
+            find_candidate_set(args, anchors, ulb_embedding, pred_1, logits_dpool, alpha_cap, grads, model)
+        is_changed = min_alphas.norm(dim=1) >= tmp_min_alphas.norm(dim=1)
+
+        min_alphas[is_changed] = tmp_min_alphas[is_changed]
+        candidates += pred_change
+
+        print("with alpha_cap set to {}, arg.alpha_cap to {}, number of change: {}".format(alpha_cap, args.alpha_cap, int(pred_change.sum().item())))
+
+        if candidates.sum() > annotations_per_iteration:
+            break
+
+    if candidates.sum() > 0:
+        print("number of candidates: {}".format(int(candidates.sum().item())))
+
+        c_alpha = F.normalize(dpool_bert_emb[candidates].view(candidates.sum(), -1), p=2, dim=1).detach()
+
+        selected_idx = sample(min(annotations_per_iteration, candidates.sum().item()), feats=c_alpha)
+        selected_idx = list(np.array(candidate_inds)[candidates][selected_idx])
+    else:
+        selected_idx = []
+
+    if len(selected_idx) < annotations_per_iteration:
+        remained = annotations_per_iteration - len(selected_idx)
+        remain_inds = random.sample([i for i in candidate_inds if i not in selected_idx], remained)
+        selected_idx = selected_idx + remain_inds
+
+    sampled_ind = selected_idx
+
+    '''
     for unlab_i, candidate in enumerate(
             tqdm(zip(dpool_bert_emb, logits_dpool), desc="Finding candidates")):
         # find indices of closesest "neighbours" in train set
         unlab_representation, unlab_logit = candidate
 
         for i in range(args.num_classes):
+            # Calculate alpha for candidate
+            if args.alpha_closed_form_approx:
+                emb_i, ulb_emb = anchors[i].to(args.device), unlab_representation.to(args.device)
+
+
             emb_mix = (1 - alpha) * unlab_representation + alpha * anchors[i]
             emb_mix = emb_mix.unsqueeze(0)
             emb_mix = emb_mix.to(args.device)
@@ -593,6 +651,7 @@ def mix_acquisition(args, annotations_per_iteration, X_original, y_original,
 
     # map from dpool inds to original inds
     sampled_ind = list(np.array(candidate_inds)[selected_inds])  # in terms of original inds
+    '''
 
     if num_adv is not None:
         num_adv_per = round(num_adv / len(candidate_inds), 2)
@@ -659,3 +718,71 @@ def mix_acquisition(args, annotations_per_iteration, X_original, y_original,
     return sampled_ind, stats
 
 
+def calculate_optimum_alpha(eps, lb_embedding, ulb_embedding, ulb_grads):
+    z = (lb_embedding - ulb_embedding)  # * ulb_grads
+    alpha = (eps * z.norm(dim=1) / ulb_grads.norm(dim=1)).unsqueeze(dim=1).repeat(1, z.size(1)) * ulb_grads / (z + 1e-8)
+
+    return alpha
+
+
+def sample(n, feats):
+    feats = feats.numpy()
+    cluster_learner = KMeans(n_clusters=n)
+    cluster_learner.fit(feats)
+
+    cluster_idxs = cluster_learner.predict(feats)
+    centers = cluster_learner.cluster_centers_[cluster_idxs]
+    dis = (feats - centers) ** 2
+    dis = dis.sum(axis=1)
+    return np.array(
+        [np.arange(feats.shape[0])[cluster_idxs == i][dis[cluster_idxs == i].argmin()] for i in range(n) if
+         (cluster_idxs == i).sum() > 0])
+
+
+def find_candidate_set(args, anchors, ulb_embedding, pred_1, ulb_probs, alpha_cap, grads, model):
+
+    unlabeled_size = ulb_embedding.size(0)
+    embedding_size = ulb_embedding.size(1)
+
+    tmp_min_alphas = torch.ones((unlabeled_size, embedding_size), dtype=torch.float)
+    pred_change = torch.zeros(unlabeled_size, dtype=torch.bool)
+
+    if args.alpha_closed_form_approx:
+        alpha_cap /= math.sqrt(embedding_size)
+        grads = grads.to(args.device)
+
+    for i in range(args.num_classes):
+        if args.alpha_closed_form_approx:
+            anchor_i = anchors[i].view(1, -1).repeat(unlabeled_size, 1)
+            embed_i, ulb_embed = anchor_i.to(args.device), ulb_embedding.to(args.device)
+            alpha = calculate_optimum_alpha(alpha_cap, embed_i, ulb_embed, grads)
+            embedding_mix = (1 - alpha) * ulb_embed + alpha * embed_i
+            logits = model.classifier(embedding_mix)
+            logits = logits.detach().cpu()
+            alpha = alpha.cpu()
+
+            pc = logits.argmax(dim=1) != pred_1
+        else:
+            anchor_i = anchors[i].view(1, -1).repeat(unlabeled_size, 1)
+            # embed_i, ulb_embed = anchor_i.to(args.device), dpool_bert_emb.to(args.device)
+            alpha = torch.normal(
+                mean=alpha_cap / 2.0,
+                std=alpha_cap / 2.0,
+                size=(unlabeled_size, embedding_size)
+            )
+            alpha[torch.isnan(alpha)] = 1
+            embedding_mix = (1 - alpha) * ulb_embedding + alpha * anchor_i
+            logits = model.classifier(embedding_mix.to(args.device))
+            logits = logits.detach().cpu()
+
+            pc = logits.argmax(dim=1) != pred_1
+
+        torch.cuda.empty_cache()
+        # print("mix with class {}, states changes {}".format(i, pc.sum().item()))
+
+        alpha[~pc] = 1.
+        pred_change[pc] = True
+        is_min = tmp_min_alphas.norm(dim=1) > alpha.norm(dim=1)
+        tmp_min_alphas[is_min] = alpha[is_min]
+
+    return pred_change, tmp_min_alphas
