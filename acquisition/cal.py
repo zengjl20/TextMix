@@ -87,7 +87,8 @@ def contrastive_acquisition(args, annotations_per_iteration, X_original, y_origi
                                                    al_test=False, mc_samples=None,
                                                    return_mean_embs=args.mean_embs,
                                                    return_mean_output=args.mean_out,
-                                                   return_cls=args.cls
+                                                   return_cls=args.cls,
+                                                   return_cnn=args.cnn
                                                    )
         criterion = nn.KLDivLoss(reduction='none') if not args.ce else nn.CrossEntropyLoss()
         bert_score_matrix, bs_calc_time = calculate_bertscore(args, X_original, original_inds)
@@ -141,7 +142,8 @@ def contrastive_acquisition(args, annotations_per_iteration, X_original, y_origi
                                                    al_test=False, mc_samples=None,
                                                    return_mean_embs=args.mean_embs,
                                                    return_mean_output=args.mean_out,
-                                                   return_cls=args.cls
+                                                   return_cls=args.cls,
+                                                   return_cnn=args.cnn
                                                    )
         dtrain_tfidf = tfidf_dtrain_reprs
         dpool_tfidf = tfidf_dpool_reprs
@@ -258,7 +260,8 @@ def contrastive_acquisition(args, annotations_per_iteration, X_original, y_origi
                                                    al_test=False, mc_samples=None,
                                                    return_mean_embs=args.mean_embs,
                                                    return_mean_output=args.mean_out,
-                                                   return_cls=args.cls
+                                                   return_cls=args.cls,
+                                                   return_cnn=args.cnn
                                                    )
         if args.bert_rep and bert_representations is not None:
             # Use representations of pretrained model
@@ -495,7 +498,8 @@ def mix_acquisition(args, annotations_per_iteration, X_original, y_original,
                                                al_test=False, mc_samples=None,
                                                return_mean_embs=args.mean_embs,
                                                return_mean_output=args.mean_out,
-                                               return_cls=args.cls
+                                               return_cls=args.cls,
+                                               return_cnn=args.cnn
                                                )
     if args.bert_rep and bert_representations is not None:
         # Use representations of pretrained model
@@ -520,6 +524,10 @@ def mix_acquisition(args, annotations_per_iteration, X_original, y_original,
             dpool_reprs = results_dpool[embs]
         elif args.cls:
             embs = 'bert_cls'
+            dtrain_reprs = _train_results[embs]
+            dpool_reprs = results_dpool[embs]
+        elif args.cnn:
+            embs = 'bert_cnn'
             dtrain_reprs = _train_results[embs]
             dpool_reprs = results_dpool[embs]
         else:
@@ -559,13 +567,17 @@ def mix_acquisition(args, annotations_per_iteration, X_original, y_original,
     model.eval()
     if args.alpha_closed_form_approx:
         var_emb = Variable(ulb_embedding, requires_grad=True).to(args.device)
-        logits_ = model.classifier(var_emb)
+        if not args.cnn:
+            logits_ = model.classifier(var_emb)
+        else:
+            logits_ = model.textcnn.Weight(var_emb) + model.textcnn.bias
         loss = F.cross_entropy(logits_, pred_1.to(args.device))
         grads = torch.autograd.grad(loss, var_emb)[0].data.cpu()
         del loss, var_emb, logits_
     else:
         grads = None
 
+    '''
     unlabeled_size = dpool_bert_emb.size(0)
     embedding_size = dpool_bert_emb.size(1)
 
@@ -604,8 +616,9 @@ def mix_acquisition(args, annotations_per_iteration, X_original, y_original,
         selected_idx = selected_idx + remain_inds
 
     sampled_ind = selected_idx
-
     '''
+
+    alpha = 0.5
     for unlab_i, candidate in enumerate(
             tqdm(zip(dpool_bert_emb, logits_dpool), desc="Finding candidates")):
         # find indices of closesest "neighbours" in train set
@@ -629,7 +642,8 @@ def mix_acquisition(args, annotations_per_iteration, X_original, y_original,
     print("Get the candidate, candidate size is {}".format(len(query_candidates)))
     candidate_emb = dpool_bert_emb[query_candidates].view(len(query_candidates), -1)
     candidate_emb = candidate_emb.numpy()
-    n = min(annotations_per_iteration, len(query_candidates))
+    # n = min(annotations_per_iteration, len(query_candidates))
+    n = len(query_candidates) / 10
     print("Starting cluster")
     cluster_learner = KMeans(n_clusters=n)
     cluster_learner.fit(candidate_emb)
@@ -651,7 +665,7 @@ def mix_acquisition(args, annotations_per_iteration, X_original, y_original,
 
     # map from dpool inds to original inds
     sampled_ind = list(np.array(candidate_inds)[selected_inds])  # in terms of original inds
-    '''
+
 
     if num_adv is not None:
         num_adv_per = round(num_adv / len(candidate_inds), 2)
@@ -757,7 +771,10 @@ def find_candidate_set(args, anchors, ulb_embedding, pred_1, ulb_probs, alpha_ca
             embed_i, ulb_embed = anchor_i.to(args.device), ulb_embedding.to(args.device)
             alpha = calculate_optimum_alpha(alpha_cap, embed_i, ulb_embed, grads)
             embedding_mix = (1 - alpha) * ulb_embed + alpha * embed_i
-            logits = model.classifier(embedding_mix)
+            if not args.cnn:
+                logits = model.classifier(embedding_mix)
+            else:
+                logits = model.textcnn.Weight(embedding_mix) + model.textcnn.bias
             logits = logits.detach().cpu()
             alpha = alpha.cpu()
 
@@ -772,7 +789,10 @@ def find_candidate_set(args, anchors, ulb_embedding, pred_1, ulb_probs, alpha_ca
             )
             alpha[torch.isnan(alpha)] = 1
             embedding_mix = (1 - alpha) * ulb_embedding + alpha * anchor_i
-            logits = model.classifier(embedding_mix.to(args.device))
+            if not args.cnn:
+                logits = model.classifier(embedding_mix.to(args.device))
+            else:
+                logits = model.textcnn.Weight(embedding_mix) + model.textcnn.bias
             logits = logits.detach().cpu()
 
             pc = logits.argmax(dim=1) != pred_1

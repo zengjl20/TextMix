@@ -407,7 +407,8 @@ def al_loop(args):
                                                                              model=train_results['model'],
                                                                              return_mean_embs=args.mean_embs,
                                                                              return_mean_output=args.mean_out,
-                                                                             return_cls=args.cls)
+                                                                             return_cls=args.cls,
+                                                                             return_cnn=args.cnn)
             results_dpool.pop('gold_labels', None)
         end = time.time()
         inference_time = end - start
@@ -723,6 +724,7 @@ if __name__ == '__main__':
     parser.add_argument("--mean_embs", default=False, type=bool, help="if True use bert mean embeddings for kNN")
     parser.add_argument("--mean_out", default=False, type=bool, help="if True use bert mean outputs for kNN")
     parser.add_argument("--cls", default=True, type=bool, help="if True use cls embedding for kNN")
+    parser.add_argument("--cnn", default=False, type=bool, help="if True use cnn feature for mix")
     # parser.add_argument("--kl_div", default=True, type=bool, help="if True choose KL divergence for scoring")
     parser.add_argument("--ce", default=False, type=bool, help="if True choose cross entropy for scoring")
     parser.add_argument("--operator", default="mean", type=str, help="operator to combine scores of neighbours")
@@ -760,7 +762,7 @@ if __name__ == '__main__':
 
     # Setup CUDA, GPU & distributed training
     if args.local_rank == -1 or args.no_cuda:
-        args.device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+        args.device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
         args.n_gpu = 0 if args.no_cuda else 1
     else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.cuda.set_device(args.local_rank)

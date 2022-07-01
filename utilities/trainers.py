@@ -19,6 +19,7 @@ from torch.optim import AdamW
 from torch.utils.data import SequentialSampler, DataLoader, TensorDataset, RandomSampler, DistributedSampler
 from tqdm import tqdm, trange
 from transformers import AutoTokenizer, AutoModelForSequenceClassification, AutoConfig, get_linear_schedule_with_warmup
+from transformers import BertTokenizer, BertForSequenceClassification, BertConfig
 from transformers.data.metrics import simple_accuracy
 
 sys.path.append("../../")
@@ -30,6 +31,8 @@ from utilities.early_stopping import EarlyStopping
 from utilities.general import create_dir, number_h
 from utilities.metrics import uncertainty_metrics, compute_metrics
 from utilities.preprocessors import output_modes, processors, convert_examples_to_features
+from myModel import MyModel
+
 
 logger = logging.getLogger(__name__)
 
@@ -510,7 +513,7 @@ def load_and_cache_examples(args, task, tokenizer, evaluate=False, overwrite_cac
 
 
 def my_evaluate(eval_dataset, args, model, prefix="", al_test=False, mc_samples=None,
-                return_mean_embs=False, return_mean_output=False, return_cls=False):
+                return_mean_embs=False, return_mean_output=False, return_cls=False, return_cnn=False):
     """
     Evaluate model using 'eval_dataset'.
     :param eval_dataset: tensor dataset
@@ -555,6 +558,7 @@ def my_evaluate(eval_dataset, args, model, prefix="", al_test=False, mc_samples=
         bert_mean_output_list = None
         bert_mean_input_list = None
         bert_cls_list = None
+        bert_cnn_list = None
 
         if mc_samples is not None and al_test:
             # Evaluation of Dpool - MC dropout
@@ -579,6 +583,7 @@ def my_evaluate(eval_dataset, args, model, prefix="", al_test=False, mc_samples=
                         # else:
                         outputs = model(**inputs)
                         tmp_eval_loss, logits = outputs[:2]
+                        #tmp_eval_loss, logits = outputs.loss, outputs.logits
 
                         eval_loss += tmp_eval_loss.mean().item()
                     nb_eval_steps += 1
@@ -614,13 +619,17 @@ def my_evaluate(eval_dataset, args, model, prefix="", al_test=False, mc_samples=
                         )  # XLM, DistilBERT, RoBERTa, and XLM-RoBERTa don't use segment_ids
                     outputs = model(**inputs)
                     labels = inputs.pop("labels", None)
-                    if hasattr(args, 'acquisition') or return_cls:
+                    if hasattr(args, 'acquisition') or return_cls or return_cnn:
                         if return_cls or return_mean_output:
                             bert_output, bert_output_cls = model.bert(**inputs)
                             bert_mean_output = torch.mean(bert_output, dim=1)
                         if return_mean_embs:
                             bert_input = model.bert.embeddings(inputs['input_ids'])
                             bert_mean_input = torch.mean(bert_input, dim=1)
+                        if return_cnn:
+                            bert_output, bert_output_cls = model.bert(**inputs)
+                            _, bert_cnn_features = model.textcnn(bert_output)
+                            # print("get cnn features of samples in Dpool!")
 
                     tmp_eval_loss, logits = outputs[:2]
 
@@ -637,6 +646,8 @@ def my_evaluate(eval_dataset, args, model, prefix="", al_test=False, mc_samples=
                         bert_mean_output_list = bert_mean_output
                     if return_cls:
                         bert_cls_list = bert_output_cls
+                    if return_cnn:
+                        bert_cnn_list = bert_cnn_features
                 else:
                     preds = np.append(preds, logits.detach().cpu().numpy(), axis=0)
                     # out_label_ids = np.append(out_label_ids, inputs["labels"].detach().cpu().numpy(), axis=0)
@@ -650,6 +661,8 @@ def my_evaluate(eval_dataset, args, model, prefix="", al_test=False, mc_samples=
                         bert_mean_output_list = torch.cat((bert_mean_output_list, bert_mean_output), 0)
                     if return_cls:
                         bert_cls_list = torch.cat((bert_cls_list, bert_output_cls), 0)
+                    if return_cnn:
+                        bert_cnn_list = torch.cat((bert_cnn_list, bert_cnn_features), 0)
 
             eval_loss = eval_loss / nb_eval_steps
             logits = torch.tensor(preds)
@@ -684,6 +697,7 @@ def my_evaluate(eval_dataset, args, model, prefix="", al_test=False, mc_samples=
         results.update({'bert_mean_inputs': bert_mean_input_list})
         results.update({'bert_mean_output': bert_mean_output_list})
         results.update({'bert_cls': bert_cls_list})
+        results.update({'bert_cnn': bert_cnn_list})
         results.update({'gold_labels': out_label_ids.tolist()})
     # return results, eval_loss, accuracy, f1, precision, recall, logits
     return results, logits
@@ -726,7 +740,10 @@ def train_transformer(args, train_dataset, eval_dataset, model, tokenizer, unsup
             global_step = checkpoint.split("-")[-1] if len(checkpoints) > 1 else ""
             prefix = checkpoint.split("/")[-1] if checkpoint.find("checkpoint") != -1 else ""
 
-            model = AutoModelForSequenceClassification.from_pretrained(checkpoint)
+            if args.cnn:
+                model = MyModel.from_pretrained(checkpoint)
+            else:
+                model = BertForSequenceClassification.from_pretrained(checkpoint)
             model.to(args.device)
 
             result, logits = my_evaluate(eval_dataset, args, model, prefix=prefix)
@@ -825,12 +842,20 @@ def train_transformer_model(args, X_inds, X_val_inds=None,
         # while val_acc_current < val_acc_previous - 0.005 and times_trained < 1:
         times_trained += 1
 
-        model = AutoModelForSequenceClassification.from_pretrained(
-            args.model_name_or_path,
-            from_tf=bool(".ckpt" in args.model_name_or_path),
-            config=config,
-            cache_dir=args.cache_dir,
-        )
+        if args.cnn:
+            model = MyModel.from_pretrained(
+                args.model_name_or_path,
+                from_tf=bool(".ckpt" in args.model_name_or_path),
+                config=config,
+                cache_dir=args.cache_dir,
+            )
+        else:
+            model = BertForSequenceClassification.from_pretrained(
+                args.model_name_or_path,
+                from_tf=bool(".ckpt" in args.model_name_or_path),
+                config=config,
+                cache_dir=args.cache_dir,
+            )
 
         if args.local_rank == 0:
             torch.distributed.barrier()  # Make sure only the first process in distributed training will download model & vocab
@@ -860,7 +885,10 @@ def train_transformer_model(args, X_inds, X_val_inds=None,
     train_loss = train_loss_list[best_trial - 1]
     results = results_list[best_trial - 1]
     best_model_ckpt = original_output_dir + '_trial{}'.format(best_trial)
-    model = AutoModelForSequenceClassification.from_pretrained(best_model_ckpt)
+    if args.cnn:
+        model = MyModel.from_pretrained(best_model_ckpt)
+    else:
+        model = BertForSequenceClassification.from_pretrained(best_model_ckpt)
     model.to(args.device)
     if os.path.isdir(original_output_dir):
         shutil.rmtree(original_output_dir)
@@ -896,7 +924,7 @@ def train_transformer_model(args, X_inds, X_val_inds=None,
 
 
 def test_transformer_model(args, X_inds=None, model=None, ckpt=None, augm_dataset=None, dataset=None,
-                           return_mean_embs=False, return_mean_output=False, return_cls=False):
+                           return_mean_embs=False, return_mean_output=False, return_cls=False, return_cnn=False):
     """
     Test transformer model on Dpool during an AL iteration
     :param args: arguments
@@ -921,12 +949,16 @@ def test_transformer_model(args, X_inds=None, model=None, ckpt=None, augm_datase
         # dataset to test model on
         dpool_dataset = dataset
     if model is None:
-        model = AutoModelForSequenceClassification.from_pretrained(ckpt)
+        if args.cnn:
+            model = MyModel.from_pretrained(ckpt)
+        else:
+            model = BertForSequenceClassification.from_pretrained(ckpt)
         model.to(args.device)
     print('MC samples N={}'.format(args.mc_samples))
     result, logits = my_evaluate(dpool_dataset, args, model, al_test=True, mc_samples=args.mc_samples,
                                  return_mean_embs=return_mean_embs,
                                  return_mean_output=return_mean_output,
-                                 return_cls=return_cls)
+                                 return_cls=return_cls,
+                                 return_cnn=return_cnn)
     eval_loss = result['loss']
     return eval_loss, logits, result
